@@ -255,6 +255,48 @@ def test_can_subscribe_for_a_specific_tag(worker):
         worker.unsubscribe(subid)
 
 
+@uses_worker("sleep_async", max_concurrency=5)
+def test_can_run_predictions_concurrently_on_async_predictor(worker):
+    tag = "123"
+
+    result = Result()
+    subid = worker.subscribe(result.handle_event, tag=tag)
+    subids = []
+
+    try:
+        start = time.time()
+        futures = []
+        results = []
+        for i in range(5):
+            result = Result()
+            results.append(result)
+            tag = f"tag-{i}"
+            subids.append(worker.subscribe(result.handle_event, tag=tag))
+            futures.append(worker.predict({"sleep": 0.5}, tag=tag))
+            assert not result.done
+
+        for fut in futures:
+            fut.result()
+
+        end = time.time()
+
+        duration = end - start
+        # we should take at least 0.5 seconds (the time for 1 prediction) but
+        # not more than double that
+        assert duration >= 0.5
+        assert duration <= 1.0
+
+        for result in results:
+            assert result.done
+            assert not result.done.canceled
+            assert not result.exception
+            assert result.stdout == "starting\n"
+            assert result.output == "done in 0.5 seconds"
+
+    finally:
+        worker.unsubscribe(subid)
+
+
 @uses_worker("stream_redirector_race_condition")
 def test_stream_redirector_race_condition(worker):
     """
