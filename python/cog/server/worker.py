@@ -76,7 +76,7 @@ class WorkerState(Enum):
 class PredictionState:
     def __init__(
         self, tag: Optional[str], payload: Dict[str, Any], result: "Future[Done]"
-    ):
+    ) -> None:
         self.tag = tag
         self.payload = payload
         self.result = result
@@ -103,8 +103,11 @@ class Worker:
 
         self._max_concurrency = max_concurrency
 
+        self._predictions_lock = threading.Lock()
         self._predictions_in_flight: Dict[Optional[str], PredictionState] = {}
-        self._prediction_input_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self._prediction_input_queue: queue.SimpleQueue[Optional[str]] = (
+            queue.SimpleQueue()
+        )
 
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._event_consumer = None
@@ -127,18 +130,19 @@ class Worker:
                 "Invalid operation: tag is required when Worker has max_concurrency > 1"
             )
 
-        if len(self._predictions_in_flight) >= self._max_concurrency:
-            raise InvalidStateException(
-                f"Invalid operation: maximum predictions in flight reached"
-            )
-        if tag in self._predictions_in_flight:
-            raise InvalidStateException(
-                f"Invalid operation: prediction with tag {tag} already running"
-            )
-        self._assert_state(WorkerState.READY)
-        result = Future()
-        self._predictions_in_flight[tag] = PredictionState(tag, payload, result)
-        self._prediction_input_queue.put(tag)
+        with self._predictions_lock:
+            if len(self._predictions_in_flight) >= self._max_concurrency:
+                raise InvalidStateException(
+                    "Invalid operation: maximum predictions in flight reached"
+                )
+            if tag in self._predictions_in_flight:
+                raise InvalidStateException(
+                    f"Invalid operation: prediction with tag {tag} already running"
+                )
+            self._assert_state(WorkerState.READY)
+            result = Future()
+            self._predictions_in_flight[tag] = PredictionState(tag, payload, result)
+            self._prediction_input_queue.put(tag)
         return result
 
     def subscribe(
@@ -187,11 +191,12 @@ class Worker:
         self._pool.shutdown(wait=False)
 
     def cancel(self, tag: Optional[str] = None) -> None:
-        predict_state = self._predictions_in_flight.get(tag)
-        if predict_state and not predict_state.cancel_sent:
-            self._child.send_cancel()
-            self._events.send(Envelope(event=Cancel(), tag=tag))
-            predict_state.cancel_sent = True
+        with self._predictions_lock:
+            predict_state = self._predictions_in_flight.get(tag)
+            if predict_state and not predict_state.cancel_sent:
+                self._child.send_cancel()
+                self._events.send(Envelope(event=Cancel(), tag=tag))
+                predict_state.cancel_sent = True
 
     def _assert_state(self, state: WorkerState) -> None:
         if self._state != state:
@@ -249,39 +254,38 @@ class Worker:
 
         # Main event loop
         while self._child.is_alive():
-            # first see if the child has sent any events
+            # see if we have any new prediction requests
+            if not self._prediction_input_queue.empty():
+                tag = self._prediction_input_queue.get(block=False)
+
+                with self._predictions_lock:
+                    state = self._predictions_in_flight[tag]
+                assert state is not None
+
+                # Prepare payload (download URLPath objects)
+                # FIXME this blocks the event loop, which is bad in concurrent mode
+                try:
+                    _prepare_payload(state.payload)
+                except Exception as e:
+                    done = Done(error=True, error_detail=str(e))
+                    self._publish(Envelope(done, tag))
+                    self._complete_prediction(done, tag)
+                else:
+                    # Start the prediction
+                    self._events.send(
+                        Envelope(
+                            event=PredictionInput(payload=state.payload),
+                            tag=tag,
+                        )
+                    )
+                continue
+
+            # otherwise see if the child has sent any events
             if self._events.poll():
                 e = self._events.recv()
                 self._publish(e)
                 if isinstance(e.event, Done):
                     self._complete_prediction(e.event, e.tag)
-                continue
-
-            # otherwise see if we have any new prediction requests
-            try:
-                tag = self._prediction_input_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            state = self._predictions_in_flight[tag]
-            assert state is not None
-
-            # Prepare payload (download URLPath objects)
-            # FIXME this blocks the event loop, which is bad in concurrent mode
-            try:
-                _prepare_payload(state.payload)
-            except Exception as e:
-                done = Done(error=True, error_detail=str(e))
-                self._publish(Envelope(done, tag))
-                self._complete_prediction(done, tag)
-            else:
-                # Start the prediction
-                self._events.send(
-                    Envelope(
-                        event=PredictionInput(payload=state.payload),
-                        tag=tag,
-                    )
-                )
 
         # If we dropped off the end off the end of the loop, it's because the
         # child process died.  First, process any remaining messages on the connection
@@ -293,19 +297,21 @@ class Worker:
 
         if not self._terminating:
             self._state = WorkerState.DEFUNCT
-            for tag in list(self._predictions_in_flight.keys()):
-                exitcode = self._child.exitcode
-                self._predictions_in_flight[tag].result.set_exception(
-                    FatalWorkerException(
-                        f"Prediction failed for an unknown reason. It might have run out of memory? (exitcode {exitcode})"
+            with self._predictions_lock:
+                for tag in list(self._predictions_in_flight.keys()):
+                    exitcode = self._child.exitcode
+                    self._predictions_in_flight[tag].result.set_exception(
+                        FatalWorkerException(
+                            f"Prediction failed for an unknown reason. It might have run out of memory? (exitcode {exitcode})"
+                        )
                     )
-                )
-                del self._predictions_in_flight[tag]
+                    del self._predictions_in_flight[tag]
 
     def _complete_prediction(self, done: Done, tag: Optional[str]) -> None:
         # We update the in-flight dictionary before completing the prediction
         # future, so that we can immediately accept work.
-        predict_state = self._predictions_in_flight.pop(tag)
+        with self._predictions_lock:
+            predict_state = self._predictions_in_flight.pop(tag)
         if len(self._predictions_in_flight) == 0:
             self._state = WorkerState.READY
         predict_state.result.set_result(done)

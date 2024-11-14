@@ -557,7 +557,7 @@ class WorkerStateMachine(RuleBasedStateMachine):
 
         self.pending = threading.Semaphore(0)
 
-        self.worker = Worker(child=self.child, events=parent_conn)
+        self.worker = Worker(child=self.child, events=parent_conn, max_concurrency=4)
 
     def simulate_events(self, events, *, tag=None, target=None):
         def _handle_event(ev):
