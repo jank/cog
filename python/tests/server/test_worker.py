@@ -18,9 +18,11 @@ from hypothesis.stateful import (
 )
 
 from cog.server.eventtypes import (
+    Cancel,
     Done,
     Envelope,
     Log,
+    PredictionInput,
     PredictionMetric,
     PredictionOutput,
     PredictionOutputType,
@@ -550,7 +552,6 @@ class WorkerStateMachine(RuleBasedStateMachine):
         super().__init__()
 
         parent_conn, child_conn = multiprocessing.get_context("spawn").Pipe()
-        parent_conn.send = lambda x: None  # FIXME: do something less awful
 
         self.child = FakeChildWorker()
         self.child_events = child_conn
@@ -629,6 +630,13 @@ class WorkerStateMachine(RuleBasedStateMachine):
         except InvalidStateException:
             return multiple()
         else:
+            assert self.child_events.poll(timeout=0.5)
+            e = self.child_events.recv()
+            assert isinstance(e, Envelope)
+            assert isinstance(e.event, PredictionInput)
+            assert e.tag == tag.hex
+            assert not self.child_events.poll(timeout=0.1)
+
             return PredictState(tag=tag.hex, payload=payload, fut=fut, result=Result())
 
     @rule(
@@ -712,7 +720,19 @@ class WorkerStateMachine(RuleBasedStateMachine):
     )
     def cancel(self, state: PredictState):
         self.worker.cancel(tag=state.tag)
-        assert self.child.cancel_sent
+
+        if state.canceled:
+            # if this has previously been canceled, we expect no Cancel event
+            # sent to the child
+            assert not self.child_events.poll(timeout=0.1)
+        else:
+            assert self.child_events.poll(timeout=0.5)
+            e = self.child_events.recv()
+            assert isinstance(e, Envelope)
+            assert isinstance(e.event, Cancel)
+            assert e.tag == state.tag
+            assert self.child.cancel_sent
+
         return evolve(state, canceled=True)
 
     def teardown(self):

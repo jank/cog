@@ -4,7 +4,6 @@ import contextvars
 import inspect
 import multiprocessing
 import os
-import queue
 import signal
 import sys
 import threading
@@ -26,6 +25,7 @@ from typing import (
 )
 
 import structlog
+from attrs import define
 
 from ..base_predictor import BasePredictor
 from ..json import make_encodeable
@@ -73,6 +73,16 @@ class WorkerState(Enum):
     DEFUNCT = auto()
 
 
+@define
+class PredictionRequest:
+    tag: Optional[str]
+
+
+@define
+class CancelRequest:
+    tag: Optional[str]
+
+
 class PredictionState:
     def __init__(
         self, tag: Optional[str], payload: Dict[str, Any], result: "Future[Done]"
@@ -105,9 +115,10 @@ class Worker:
 
         self._predictions_lock = threading.Lock()
         self._predictions_in_flight: Dict[Optional[str], PredictionState] = {}
-        self._prediction_input_queue: queue.SimpleQueue[Optional[str]] = (
-            queue.SimpleQueue()
-        )
+
+        recv_conn, send_conn = _spawn.Pipe(duplex=False)
+        self._request_send_conn = send_conn
+        self._request_recv_conn = recv_conn
 
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._event_consumer = None
@@ -142,7 +153,7 @@ class Worker:
             self._assert_state(WorkerState.READY)
             result = Future()
             self._predictions_in_flight[tag] = PredictionState(tag, payload, result)
-            self._prediction_input_queue.put(tag)
+            self._request_send_conn.send(PredictionRequest(tag))
         return result
 
     def subscribe(
@@ -191,12 +202,7 @@ class Worker:
         self._pool.shutdown(wait=False)
 
     def cancel(self, tag: Optional[str] = None) -> None:
-        with self._predictions_lock:
-            predict_state = self._predictions_in_flight.get(tag)
-            if predict_state and not predict_state.cancel_sent:
-                self._child.send_cancel()
-                self._events.send(Envelope(event=Cancel(), tag=tag))
-                predict_state.cancel_sent = True
+        self._request_send_conn.send(CancelRequest(tag))
 
     def _assert_state(self, state: WorkerState) -> None:
         if self._state != state:
@@ -255,45 +261,52 @@ class Worker:
         # Main event loop
         while self._child.is_alive():
             # see if we have any new prediction requests
-            if not self._prediction_input_queue.empty():
-                tag = self._prediction_input_queue.get(block=False)
+            if self._request_recv_conn.poll():
+                ev = self._request_recv_conn.recv()
+                if isinstance(ev, PredictionRequest):
+                    with self._predictions_lock:
+                        state = self._predictions_in_flight[ev.tag]
 
-                with self._predictions_lock:
-                    state = self._predictions_in_flight[tag]
-                assert state is not None
-
-                # Prepare payload (download URLPath objects)
-                # FIXME this blocks the event loop, which is bad in concurrent mode
-                try:
-                    _prepare_payload(state.payload)
-                except Exception as e:
-                    done = Done(error=True, error_detail=str(e))
-                    self._publish(Envelope(done, tag))
-                    self._complete_prediction(done, tag)
-                else:
-                    # Start the prediction
-                    self._events.send(
-                        Envelope(
-                            event=PredictionInput(payload=state.payload),
-                            tag=tag,
+                    # Prepare payload (download URLPath objects)
+                    # FIXME this blocks the event loop, which is bad in concurrent mode
+                    try:
+                        _prepare_payload(state.payload)
+                    except Exception as e:
+                        done = Done(error=True, error_detail=str(e))
+                        self._publish(Envelope(done, state.tag))
+                        self._complete_prediction(done, state.tag)
+                    else:
+                        # Start the prediction
+                        self._events.send(
+                            Envelope(
+                                event=PredictionInput(payload=state.payload),
+                                tag=state.tag,
+                            )
                         )
-                    )
+                if isinstance(ev, CancelRequest):
+                    with self._predictions_lock:
+                        predict_state = self._predictions_in_flight.get(ev.tag)
+                        if predict_state and not predict_state.cancel_sent:
+                            self._child.send_cancel()
+                            self._events.send(Envelope(event=Cancel(), tag=ev.tag))
+                            predict_state.cancel_sent = True
+
                 continue
 
             # otherwise see if the child has sent any events
             if self._events.poll():
-                e = self._events.recv()
-                self._publish(e)
-                if isinstance(e.event, Done):
-                    self._complete_prediction(e.event, e.tag)
+                ev = self._events.recv()
+                self._publish(ev)
+                if isinstance(ev.event, Done):
+                    self._complete_prediction(ev.event, ev.tag)
 
         # If we dropped off the end off the end of the loop, it's because the
         # child process died.  First, process any remaining messages on the connection
         while self._events.poll():
-            e = self._events.recv()
-            self._publish(e)
-            if isinstance(e.event, Done):
-                self._complete_prediction(e.event, e.tag)
+            ev = self._events.recv()
+            self._publish(ev)
+            if isinstance(ev.event, Done):
+                self._complete_prediction(ev.event, ev.tag)
 
         if not self._terminating:
             self._state = WorkerState.DEFUNCT
